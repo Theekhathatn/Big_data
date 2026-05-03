@@ -1,0 +1,214 @@
+"""
+Forex D1 ETL Pipeline
+=====================
+ETL Pipeline for processing 9 Forex pairs daily data (D1 timeframe)
+Compatible with Airflow 2.10+ / 3.x
+"""
+
+import os
+import glob
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+from airflow import DAG
+from airflow.providers.standard.operators.python import PythonOperator
+
+# ==================== CONFIGURATION ====================
+# ✅ ใช้ Path สัมพัทธ์หรืออ่านจาก Environment Variable
+BASE_DIR = Path(
+    os.environ.get("BIG_DATA_PROJECT_DIR", "/home/theek/Downloads/Big_Data_Project")
+)
+RAW_DIR = BASE_DIR / "data" / "raw"
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+REQUIRED_COLS = [
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "tick_volume",
+    "spread",
+    "real_volume",
+    "date",
+]
+
+default_args = {
+    "owner": "forex_data_team",
+    "depends_on_past": False,
+    "start_date": datetime(2024, 1, 1),
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+    "execution_timeout": timedelta(hours=1),
+}
+
+dag = DAG(
+    "forex_d1_etl_pipeline",
+    default_args=default_args,
+    description="ETL Pipeline for 9 Forex Pairs (Daily D1)",
+    schedule="@daily",
+    catchup=False,
+    tags=["forex", "etl", "big-data"],  # ✅ เพิ่ม tags เพื่อจัดกลุ่ม
+)
+
+# ==================== TASK FUNCTIONS ====================
+
+
+def extract_data(**kwargs):
+    """Task 1: Extract - อ่านไฟล์ CSV ทั้งหมด"""
+    ti = kwargs["ti"]
+    files = sorted(glob.glob(str(RAW_DIR / "*_D1.csv")))
+
+    if not files:
+        raise FileNotFoundError(f"ไม่พบไฟล์ CSV ในโฟลเดอร์: {RAW_DIR}")
+
+    file_metadata = [
+        {
+            "path": str(f),
+            "pair": Path(f).stem.replace("_D1", ""),
+            "size_bytes": os.path.getsize(f),
+        }
+        for f in files
+    ]
+
+    ti.xcom_push(key="file_list", value=file_metadata)
+    logging.info(f"✅ พบไฟล์ทั้งหมด {len(files)} ไฟล์")
+    return {"count": len(files)}
+
+
+def validate_data(**kwargs):
+    """Task 2: Validate - ตรวจสอบความถูกต้องของข้อมูล"""
+    ti = kwargs["ti"]
+    file_list = ti.xcom_pull(key="file_list")
+
+    if not file_list:
+        raise ValueError("ไม่พบข้อมูลไฟล์จาก Task ก่อนหน้า")
+
+    validation_report = {}
+    critical_errors = []
+
+    for file_info in file_list:
+        filepath = file_info["path"]
+        pair = file_info["pair"]
+
+        try:
+            df = pd.read_csv(filepath)
+
+            missing_cols = [c for c in REQUIRED_COLS if c not in df.columns]
+
+            price_errors = 0
+            if not df.empty:
+                price_errors = (
+                    (df["high"] < df["low"]).sum()
+                    + (df["open"] <= 0).sum()
+                    + (df["close"] <= 0).sum()
+                )
+
+            validation_report[pair] = {
+                "total_rows": len(df),
+                "missing_columns": missing_cols,
+                "price_logic_errors": int(price_errors),
+                "status": (
+                    "PASS"
+                    if not missing_cols and price_errors <= len(df) * 0.05
+                    else "FAIL"
+                ),
+            }
+
+            if validation_report[pair]["status"] == "FAIL":
+                critical_errors.append(f"{pair}: Validation Failed")
+
+        except Exception as e:
+            validation_report[pair] = {"status": "ERROR", "error": str(e)}
+            critical_errors.append(f"{pair}: {str(e)}")
+
+    ti.xcom_push(key="validation_report", value=validation_report)
+
+    if critical_errors:
+        raise ValueError(f"Validation Failed: {critical_errors}")
+
+    logging.info("✅ Validation Passed")
+    return validation_report
+
+
+def transform_data(**kwargs):
+    """Task 3: Transform - สร้าง Features และบันทึกเป็น Parquet"""
+    ti = kwargs["ti"]
+    file_list = ti.xcom_pull(key="file_list")
+
+    if not file_list:
+        raise ValueError("ไม่พบข้อมูลไฟล์จาก Task ก่อนหน้า")
+
+    processed_summary = []
+
+    for file_info in file_list:
+        filepath = file_info["path"]
+        pair = file_info["pair"]
+
+        df = pd.read_csv(filepath)
+
+        # แปลงคอลัมน์ date
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.sort_values("date").reset_index(drop=True)
+
+        # Feature Engineering
+        df["daily_return"] = df["close"].pct_change()
+        df["daily_range"] = df["high"] - df["low"]
+        df["volatility_20d"] = df["daily_return"].rolling(20).std()
+        df["ma_50"] = df["close"].rolling(50).mean()
+
+        output_path = PROCESSED_DIR / f"{pair}_d1_processed.parquet"
+        df.to_parquet(output_path, index=False, compression="snappy")
+
+        processed_summary.append(
+            {"pair": pair, "rows": len(df), "output": str(output_path)}
+        )
+        logging.info(f"✅ Transformed {pair} -> {output_path}")
+
+    ti.xcom_push(key="processed_summary", value=processed_summary)
+    return processed_summary
+
+
+def load_to_warehouse(**kwargs):
+    """Task 4: Load - บันทึกข้อมูลรวม"""
+    ti = kwargs["ti"]
+    processed_summary = ti.xcom_pull(key="processed_summary")
+
+    if processed_summary:
+        all_dfs = []
+        for item in processed_summary:
+            parquet_path = Path(item["output"])
+            if parquet_path.exists():
+                df = pd.read_parquet(parquet_path)
+                all_dfs.append(df)
+
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            combined_path = PROCESSED_DIR / "forex_combined.parquet"
+            combined_df.to_parquet(combined_path, index=False)
+            logging.info(f"✅ Saved combined data to {combined_path}")
+
+    logging.info(f"✅ Load Task Completed for {len(processed_summary)} pairs")
+    return {"loaded": len(processed_summary)}
+
+
+# ==================== DAG TASKS ====================
+t1 = PythonOperator(task_id="extract_raw_files", python_callable=extract_data, dag=dag)
+t2 = PythonOperator(
+    task_id="validate_schema_logic", python_callable=validate_data, dag=dag
+)
+t3 = PythonOperator(
+    task_id="transform_features", python_callable=transform_data, dag=dag
+)
+t4 = PythonOperator(
+    task_id="load_to_warehouse", python_callable=load_to_warehouse, dag=dag
+)
+
+# กำหนดลำดับการทำงาน
+t1 >> t2 >> t3 >> t4

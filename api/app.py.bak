@@ -1,0 +1,66 @@
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import pandas as pd
+from pathlib import Path
+
+app = Flask(__name__)
+CORS(app)
+
+DATA_DIR = Path(__file__).parent.parent / 'data' / 'processed'
+
+@app.route('/api/pairs', methods=['GET'])
+def get_pairs():
+    try:
+        df = pd.read_parquet(DATA_DIR / 'forex_combined.parquet')
+        pairs = df['pair'].unique().tolist()
+        return jsonify(pairs)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/data/<pair>', methods=['GET'])
+def get_pair_data(pair):
+    try:
+        limit = request.args.get('limit', 100, type=int)
+        df = pd.read_parquet(DATA_DIR / 'forex_combined.parquet')
+        pair_df = df[df['pair'] == pair].tail(limit)
+        data = pair_df.to_dict(orient='records')
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+@app.route('/api/debug', methods=['GET'])
+def debug_info():
+    from pathlib import Path
+    import os
+    data_dir = Path(__file__).parent.parent / 'data' / 'processed'
+    d1_file = data_dir / 'forex_combined.parquet'
+    h1_file = data_dir / 'forex_combined_h1.parquet'
+    return jsonify({
+        'd1_exists': d1_file.exists(),
+        'd1_size_mb': round(d1_file.stat().st_size / (1024*1024), 2) if d1_file.exists() else 0,
+        'h1_exists': h1_file.exists(),
+        'h1_size_mb': round(h1_file.stat().st_size / (1024*1024), 2) if h1_file.exists() else 0,
+        'data_dir': str(data_dir),
+    })
+
+@app.route('/api/debug', methods=['GET'])
+def debug_info():
+    from pathlib import Path
+    import os
+    data_dir = Path(__file__).parent.parent / 'data' / 'processed'
+    d1_file = data_dir / 'forex_combined.parquet'
+    h1_file = data_dir / 'forex_combined_h1.parquet'
+    return jsonify({
+        'd1_exists': d1_file.exists(),
+        'd1_size_mb': round(d1_file.stat().st_size / (1024*1024), 2) if d1_file.exists() else 0,
+        'h1_exists': h1_file.exists(),
+        'h1_size_mb': round(h1_file.stat().st_size / (1024*1024), 2) if h1_file.exists() else 0,
+        'data_dir': str(data_dir),
+    })

@@ -1,0 +1,10 @@
+Running the API server with uvicorn:
+Apps: all
+Workers: 1
+Host: 0.0.0.0:8080
+Timeout: 120
+Logfiles: -
+=================================================================
+Simple auth manager | Password for user 'admin': yq7UB3aHgrp5XxZP
+[2m2026-05-02T07:10:45.882033Z[0m [[32m[1minfo     [0m] [1mStarted server process [14741][0m [[0m[1m[34muvicorn.error[0m][0m [36mloc[0m=[35mserver.py:92[0m
+[2m2026-05-02T07:10:45.882202Z[0m [[32m[1minfo     [0m] [1mWaiting for application startup.[0m [[0m[1m[34muvicorn.error[0m][0m [36mloc[0m=[35mon.py:48[0m
